@@ -20,27 +20,61 @@ Personal-use fork. Upstream has no license; this fork is not redistributed.
 It lets a Claude Desktop chat (and claude.ai through Desktop, phone included)
 talk to the coding agents running in Herdr on this Mac.
 
-### Two scopes, six tools
+### Open agents and protected zones
 
 | Tool | Reaches |
 |---|---|
-| `list_agents()` | Agents **outside** the blocked folders, in every running session |
-| `agent_read(session, pane_id, lines=120)` | Recent output of one of those agents |
-| `agent_prompt(session, pane_id, text, timeout_ms=120000)` | Sends a prompt and waits for it to settle |
-| `itcrowd_list_agents()` | Agents **inside** the blocked folders (ItCrowd work) |
-| `itcrowd_agent_read(session, pane_id, lines=120)` | Recent output of one of those agents |
-| `itcrowd_agent_prompt(session, pane_id, text, timeout_ms=120000)` | Sends a prompt and waits for it to settle |
+| `list_agents()` | Open agents (in no zone), in every running session |
+| `agent_read(session, pane_id, lines=120)` | Recent output of an open agent |
+| `agent_prompt(session, pane_id, text, timeout_ms=120000)` | Sends a prompt to an open agent and waits for it to settle |
+| `protected_list_agents(zone)` | Agents of one protected zone |
+| `protected_agent_read(zone, session, pane_id, lines=120)` | Recent output of an agent in that zone |
+| `protected_agent_prompt(zone, session, pane_id, text, timeout_ms=120000)` | Sends a prompt to an agent in that zone |
 
-The list tools return `session`, `pane_id`, `name` (Herdr agent name, often
-null), `terminal_title_stripped`, `workspace` (label), `workspace_id`, `cwd`,
-`agent` (kind) and `agent_status`. Pass `session` + `pane_id` as the target.
+The list tools return `session`, `pane_id`, `zone` (null for open agents),
+`name` (Herdr agent name, often null), `terminal_title_stripped`, `workspace`
+(label), `workspace_id`, `cwd`, `agent` (kind) and `agent_status`. Pass
+`session` + `pane_id` (and `zone` for the protected tools) as the target.
+
+### Zones
+
+`~/.config/herdr-mcp/config.json`:
+
+```json
+{
+  "protected": {
+    "itcrowd": {
+      "sessions": ["itcrowd", "shadow"],
+      "cwd_prefixes": ["~/Projects/itcrowd"]
+    }
+  }
+}
+```
+
+- An agent belongs to a zone if its Herdr session is in `sessions` **or** its
+  `cwd` / `foreground_cwd` sits under one of `cwd_prefixes`. Paths are
+  resolved, symlinks included, before comparing.
+- If an agent matches several zones, the first zone in the file wins.
+- Anything not in a zone is open. A new Herdr session is open until it is
+  added to a zone.
+- **Add a zone:** add a key under `protected` with `sessions`, `cwd_prefixes`
+  or both. **Remove a zone:** delete its key; its agents become open at once.
+  **Open everything:** `"protected": {}`.
+- The file is read on every call, so changes need no restart.
+- A missing or invalid file (bad JSON, unknown keys, an empty zone) refuses
+  every call until it is fixed.
+
+Errors say what happened: `zone 'x' does not exist; configured zones: [...]`,
+`the agent ... is protected (zone 'x'); only the protected_* tools with
+zone='x' reach it`, `the agent ... is outside zone 'x'; it belongs to ...`,
+`no agent in session ... pane ...`.
 
 ### Why it is built this way
 
 - **Only agent tools.** Upstream's `snapshot`, `pane_read`, `pane_run`,
   `agent_start` and the tab/pane tools are removed. `pane_run` is a free shell
   in any pane and `pane_read` reads any pane, so either one would bypass the
-  ItCrowd split.
+  zones.
 - **Every running Herdr session.** Herdr runs several named sessions here
   (`herdr session list`). The server queries each running one with
   `--session`, and drops inherited `HERDR_SESSION` / `HERDR_SOCKET_PATH` so
@@ -49,24 +83,18 @@ null), `terminal_title_stripped`, `workspace` (label), `workspace_id`, `cwd`,
 - **Pane IDs, not agent names.** Most agents have no Herdr name, and agents
   started by other agents would never be on a hand-kept list. Listing first
   and addressing by pane finds them all.
-- **Split by folder, not by an allowlist.** `~/.config/herdr-mcp/config.json`:
-
-  ```json
-  { "blocked_cwd_prefixes": ["~/Projects/itcrowd"] }
-  ```
-
-  An agent whose `cwd` or `foreground_cwd` resolves under a listed folder
-  belongs to the ItCrowd scope; everything else to the normal scope. Paths are
-  resolved, so the `~/Projects` symlink matches the real path Herdr reports.
-  The file is read on every call. Missing or invalid file: everything refused.
-- **Separate ItCrowd tools, not a parameter.** Claude Desktop sets
-  permissions per tool, not per argument. Separate tools let the ItCrowd ones
-  sit at "ask every time" on their own, and the tool name tells the approver
-  what they approve. ItCrowd output passes through the personal Claude
-  account; approving a call accepts that. A timed unlock was rejected: the
-  model would trigger it, and nothing is approved per call while it lasts.
+- **Zones instead of an allowlist.** Open by default, so nothing has to be
+  kept up to date for ordinary work; only what is named in a zone is fenced.
+- **Separate protected tools, not a parameter on the normal ones.** Claude
+  Desktop sets permissions per tool, not per argument. Separate tools let the
+  protected ones sit at "ask every time" on their own, and the tool name tells
+  the approver what they approve. The zone is mandatory so a call cannot reach
+  a zone by accident. Output from a protected zone passes through the Claude
+  account running Desktop; approving a call accepts that. A timed unlock was
+  rejected: the model would trigger it, and nothing is approved per call while
+  it lasts.
 - **Prompt log.** Every prompt goes to
-  `~/.local/state/herdr-mcp/prompts.jsonl` (mode 600): date, scope, session,
+  `~/.local/state/herdr-mcp/prompts.jsonl` (mode 600): date, zone, session,
   pane, name, title, cwd, text and result.
 - **Pinned dependencies.** `mcp==2.3.0`, and `exclude-newer` freezes its own
   dependencies.
@@ -74,9 +102,9 @@ null), `terminal_title_stripped`, `workspace` (label), `workspace_id`, `cwd`,
 
 ### Using it from a chat
 
-1. Call `list_agents` (or `itcrowd_list_agents`) first. Never reuse an old
-   pane ID: they change when Herdr restarts.
-2. `agent_read` before `agent_prompt`, to see what the agent is doing.
+1. Call `list_agents` first, or `protected_list_agents(zone)` for a zone.
+   Never reuse an old pane ID: they change when Herdr restarts.
+2. Read before you prompt, to see what the agent is doing.
 3. A busy agent can take longer than `timeout_ms`. A `timeout` error does not
    mean the prompt was lost: read the agent later instead of resending.
 4. A working agent may refuse long reads (`agent_not_idle`); ask for fewer
