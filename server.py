@@ -8,7 +8,9 @@
 on this machine, safe only because transport is local stdio launched by Claude Desktop. Never print to
 stdout (protocol channel).
 
-This fork only talks to agents: list_agents, agent_read, agent_prompt. Agents whose cwd sits under a
+This fork only talks to agents: list_agents, agent_read, agent_prompt. It covers every running Herdr
+session on this machine (`herdr session list`); an agent is addressed by session + pane id, since pane
+ids repeat across sessions. Agents whose cwd sits under a
 blocked folder (see CONFIG_PATH) are hidden and refused. The config is re-read on every call, so the
 block can be lifted and restored without restarting the server. A missing or broken config refuses
 everything."""
@@ -25,6 +27,9 @@ HERDR_BIN = os.environ.get("HERDR_BIN", "/opt/homebrew/bin/herdr")
 CONFIG_PATH = os.path.expanduser(os.environ.get("HERDR_MCP_CONFIG", "~/.config/herdr-mcp/config.json"))
 LOG_PATH = os.path.expanduser(os.environ.get("HERDR_MCP_LOG", "~/.local/state/herdr-mcp/prompts.jsonl"))
 PANE_RE = re.compile(r"^[A-Za-z0-9]+:p[A-Za-z0-9]+$")  # real ids include e.g. w1:pA
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# --session decides the socket; drop inherited session vars so they cannot point elsewhere
+CHILD_ENV = {k: v for k, v in os.environ.items() if k not in ("HERDR_SESSION", "HERDR_SOCKET_PATH")}
 
 mcp = MCPServer("herdr")
 
@@ -34,7 +39,7 @@ def herdr(*args: str, timeout: float = 30) -> str:
         raise ToolError("NUL byte in argument")
     try:
         r = subprocess.run([HERDR_BIN, *args], capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, env=CHILD_ENV)
     except OSError as e:
         raise ToolError(f"herdr binary unusable ({HERDR_BIN}): {e}")
     except subprocess.TimeoutExpired:
@@ -74,26 +79,55 @@ def is_blocked(agent: dict, blocked: list[str]) -> bool:
     return False
 
 
+def running_sessions() -> list[str]:
+    sessions = json.loads(herdr("session", "list", "--json"))["sessions"]
+    return [x["name"] for x in sessions if x.get("running") and SESSION_RE.fullmatch(x.get("name", ""))]
+
+
+def workspace_labels(session: str) -> dict[str, str]:
+    try:
+        ws = json.loads(herdr("--session", session, "workspace", "list"))["result"]["workspaces"]
+        return {w["workspace_id"]: w.get("label") for w in ws}
+    except (ToolError, ValueError, KeyError, TypeError):
+        return {}
+
+
 def visible_agents() -> list[dict]:
+    """Agents in every running session, minus blocked ones. Each gets 'session' and 'workspace'."""
     blocked = blocked_dirs()
-    agents = json.loads(herdr("agent", "list"))["result"]["agents"]
-    return [a for a in agents if not is_blocked(a, blocked)]
+    out = []
+    for session in running_sessions():
+        try:
+            agents = json.loads(herdr("--session", session, "agent", "list"))["result"]["agents"]
+        except (ToolError, ValueError, KeyError, TypeError):
+            continue  # a session that stops between list and query is skipped, not fatal
+        agents = [a for a in agents if not is_blocked(a, blocked)]
+        labels = workspace_labels(session) if agents else {}
+        for a in agents:
+            a["session"] = session
+            a["workspace"] = labels.get(a.get("workspace_id"))
+        out += agents
+    return out
 
 
-def resolve(pane_id: str) -> dict:
-    """The agent in this pane, if it exists and is not blocked. Blocked and missing look the same."""
+def resolve(session: str, pane_id: str) -> dict:
+    """The agent in this session and pane, if it exists and is not blocked. Blocked and missing look the
+    same."""
+    if not SESSION_RE.fullmatch(session):
+        raise ToolError(f"invalid session {session!r}; use the session from list_agents")
     if not PANE_RE.fullmatch(pane_id):
         raise ToolError(f"invalid pane id {pane_id!r}; expected like wA:p7, from list_agents")
     for a in visible_agents():
-        if a.get("pane_id") == pane_id:
+        if a["session"] == session and a.get("pane_id") == pane_id:
             return a
-    raise ToolError(f"refused: no reachable agent in pane {pane_id}; call list_agents")
+    raise ToolError(f"refused: no reachable agent in session {session} pane {pane_id}; call list_agents")
 
 
 def log_prompt(agent: dict, text: str, result: str) -> None:
     os.makedirs(os.path.dirname(LOG_PATH), mode=0o700, exist_ok=True)
     entry = {"date": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-             "pane_id": agent.get("pane_id"), "title": agent.get("terminal_title_stripped"),
+             "session": agent.get("session"), "pane_id": agent.get("pane_id"), "name": agent.get("name"),
+             "title": agent.get("terminal_title_stripped"),
              "cwd": agent.get("cwd"), "text": text, "result": result}
     fd = os.open(LOG_PATH, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a") as f:
@@ -102,32 +136,36 @@ def log_prompt(agent: dict, text: str, result: str) -> None:
 
 @mcp.tool()
 def list_agents() -> str:
-    """Running agents you can reach, as JSON: pane_id (use it as target), title, cwd, kind, status.
-    Call this first; pane ids can change when Herdr restarts, so never reuse an old one."""
-    keep = ("pane_id", "terminal_title_stripped", "cwd", "agent", "agent_status", "workspace_id", "tab_id")
+    """Running agents you can reach in every Herdr session, as JSON: session and pane_id (use both as the
+    target), name (Herdr agent name, often null), title, workspace, cwd, kind, status. Call this first;
+    pane ids repeat across sessions and can change when Herdr restarts, so never reuse an old one."""
+    keep = ("session", "pane_id", "name", "terminal_title_stripped", "workspace", "workspace_id", "cwd",
+            "agent", "agent_status")
     return json.dumps([{k: a.get(k) for k in keep} for a in visible_agents()], ensure_ascii=False, indent=1)
 
 
 @mcp.tool()
-def agent_read(pane_id: str, lines: int = 120) -> str:
-    """Read recent terminal output of an agent (pane id from list_agents). lines clamped to 1..2000."""
-    resolve(pane_id)
+def agent_read(session: str, pane_id: str, lines: int = 120) -> str:
+    """Read recent terminal output of an agent (session and pane id from list_agents). lines clamped to
+    1..2000."""
+    resolve(session, pane_id)
     n = str(max(1, min(2000, int(lines))))
-    return herdr("agent", "read", pane_id, "--source", "recent-unwrapped", "--lines", n)
+    return herdr("--session", session, "agent", "read", pane_id, "--source", "recent-unwrapped", "--lines", n)
 
 
 @mcp.tool()
-def agent_prompt(pane_id: str, text: str, timeout_ms: int = 120000) -> str:
-    """EXECUTES commands: sends text as a prompt to a running agent (pane id from list_agents), which will
-    run commands on this machine. Waits for idle/done/blocked. On agent_blocked / agent_prompt_stalled /
-    timeout an error with the CLI's JSON is returned; a timeout does not prove the prompt was not
-    delivered, so do not blindly retry. Every prompt is logged locally."""
-    agent = resolve(pane_id)
+def agent_prompt(session: str, pane_id: str, text: str, timeout_ms: int = 120000) -> str:
+    """EXECUTES commands: sends text as a prompt to a running agent (session and pane id from list_agents),
+    which will run commands on this machine. Waits for idle/done/blocked. On agent_blocked /
+    agent_prompt_stalled / timeout an error with the CLI's JSON is returned; a timeout does not prove the
+    prompt was not delivered, so do not blindly retry. Every prompt is logged locally."""
+    agent = resolve(session, pane_id)
     if not text.strip():
         raise ToolError("empty prompt")
     t = max(1000, min(600000, int(timeout_ms)))
     try:
-        out = herdr("agent", "prompt", pane_id, text, "--wait", "--timeout", str(t), timeout=t / 1000 + 10)
+        out = herdr("--session", session, "agent", "prompt", pane_id, text, "--wait", "--timeout", str(t),
+                    timeout=t / 1000 + 10)
     except ToolError as e:
         log_prompt(agent, text, f"error: {str(e)[:500]}")
         raise
