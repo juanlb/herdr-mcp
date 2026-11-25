@@ -17,41 +17,72 @@ this server behind HTTP or a tunnel. In Claude Desktop, keep these tools on
 ## Fork changes (juanlb)
 
 Personal-use fork. Upstream has no license; this fork is not redistributed.
+It lets a Claude Desktop chat (and claude.ai through Desktop, phone included)
+talk to the coding agents running in Herdr on this Mac.
 
-- Only three tools: `list_agents`, `agent_read`, `agent_prompt`. `snapshot`,
-  `pane_read`, `pane_run`, `agent_start` and the tab/pane tools are removed:
-  `pane_run` and `pane_read` reached any pane, including blocked ones.
-- **Every running Herdr session.** The server reads `herdr session list --json`
-  and queries each running session with `--session`. Pane IDs repeat across
-  sessions, so an agent is addressed by `session` + `pane_id`, both from
-  `list_agents`. No agent names are needed, so agents started by other agents
-  show up on their own. Inherited `HERDR_SESSION` / `HERDR_SOCKET_PATH` are
-  dropped from the CLI's environment so they cannot pin it to one session.
-- **Block by folder.** `~/.config/herdr-mcp/config.json` lists folders:
+### Two scopes, six tools
+
+| Tool | Reaches |
+|---|---|
+| `list_agents()` | Agents **outside** the blocked folders, in every running session |
+| `agent_read(session, pane_id, lines=120)` | Recent output of one of those agents |
+| `agent_prompt(session, pane_id, text, timeout_ms=120000)` | Sends a prompt and waits for it to settle |
+| `itcrowd_list_agents()` | Agents **inside** the blocked folders (ItCrowd work) |
+| `itcrowd_agent_read(session, pane_id, lines=120)` | Recent output of one of those agents |
+| `itcrowd_agent_prompt(session, pane_id, text, timeout_ms=120000)` | Sends a prompt and waits for it to settle |
+
+The list tools return `session`, `pane_id`, `name` (Herdr agent name, often
+null), `terminal_title_stripped`, `workspace` (label), `workspace_id`, `cwd`,
+`agent` (kind) and `agent_status`. Pass `session` + `pane_id` as the target.
+
+### Why it is built this way
+
+- **Only agent tools.** Upstream's `snapshot`, `pane_read`, `pane_run`,
+  `agent_start` and the tab/pane tools are removed. `pane_run` is a free shell
+  in any pane and `pane_read` reads any pane, so either one would bypass the
+  ItCrowd split.
+- **Every running Herdr session.** Herdr runs several named sessions here
+  (`herdr session list`). The server queries each running one with
+  `--session`, and drops inherited `HERDR_SESSION` / `HERDR_SOCKET_PATH` so
+  they cannot pin it to one. Pane IDs repeat across sessions, hence
+  `session` + `pane_id`.
+- **Pane IDs, not agent names.** Most agents have no Herdr name, and agents
+  started by other agents would never be on a hand-kept list. Listing first
+  and addressing by pane finds them all.
+- **Split by folder, not by an allowlist.** `~/.config/herdr-mcp/config.json`:
 
   ```json
   { "blocked_cwd_prefixes": ["~/Projects/itcrowd"] }
   ```
 
-  An agent whose `cwd` or `foreground_cwd` sits under one of them is hidden
-  from `list_agents` and refused by `agent_read` and `agent_prompt`. Paths are
-  resolved, so symlinks match. The file is read on every call: edit it and the
-  next call uses it, no restart. Missing or invalid file: everything is refused.
-  Lift the block with `"blocked_cwd_prefixes": []`.
-  Override the path with `HERDR_MCP_CONFIG`.
-- **Prompt log.** Every prompt sent goes to
-  `~/.local/state/herdr-mcp/prompts.jsonl` (mode 600): date, session, pane, name, title, cwd,
-  text and result. Override with `HERDR_MCP_LOG`.
-- `mcp` pinned to `2.3.0`; `exclude-newer` freezes its own dependencies too.
+  An agent whose `cwd` or `foreground_cwd` resolves under a listed folder
+  belongs to the ItCrowd scope; everything else to the normal scope. Paths are
+  resolved, so the `~/Projects` symlink matches the real path Herdr reports.
+  The file is read on every call. Missing or invalid file: everything refused.
+- **Separate ItCrowd tools, not a parameter.** Claude Desktop sets
+  permissions per tool, not per argument. Separate tools let the ItCrowd ones
+  sit at "ask every time" on their own, and the tool name tells the approver
+  what they approve. ItCrowd output passes through the personal Claude
+  account; approving a call accepts that. A timed unlock was rejected: the
+  model would trigger it, and nothing is approved per call while it lasts.
+- **Prompt log.** Every prompt goes to
+  `~/.local/state/herdr-mcp/prompts.jsonl` (mode 600): date, scope, session,
+  pane, name, title, cwd, text and result.
+- **Pinned dependencies.** `mcp==2.3.0`, and `exclude-newer` freezes its own
+  dependencies.
 - Upstream tests removed: they exercised the removed tools.
 
-## Tools
+### Using it from a chat
 
-| Tool | What it does |
-|---|---|
-| `list_agents()` | Reachable agents in all sessions: session, pane ID, Herdr name, title, workspace, cwd, kind, status |
-| `agent_read(session, pane_id, lines=120)` | Recent output of an agent |
-| `agent_prompt(session, pane_id, text, timeout_ms=120000)` | Sends a prompt to an agent and waits for it to settle |
+1. Call `list_agents` (or `itcrowd_list_agents`) first. Never reuse an old
+   pane ID: they change when Herdr restarts.
+2. `agent_read` before `agent_prompt`, to see what the agent is doing.
+3. A busy agent can take longer than `timeout_ms`. A `timeout` error does not
+   mean the prompt was lost: read the agent later instead of resending.
+4. A working agent may refuse long reads (`agent_not_idle`); ask for fewer
+   lines or wait.
+5. After a server update, start a new chat: claude.ai keeps the tool schemas
+   it saw when the chat started.
 
 ## Install
 
